@@ -1,0 +1,1572 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  AWS Security Operations Dashboard - Public Reference. Centralizes Security Hub, GuardDuty and IAM posture with CloudWatch visualization,
+  GuardDuty, IAM credential posture (access-key age/usage, MFA, root credentials), SNS notifications,
+  CloudWatch custom metrics, EventBridge automation, and a CloudWatch dashboard.
+  This stack is read-only against Security Hub/IAM and does not rotate, disable, or delete credentials.
+
+Metadata:
+  Purpose: Public reference template
+  Privacy: No customer-specific identifiers, ARNs, IPs, domains, usernames, access keys, or resource IDs are embedded in this template.
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: Optional email address to subscribe to security notifications. Leave blank to create the SNS topic without an email subscription.
+
+  DashboardName:
+    Type: String
+    Default: AWS-Security-Operations-Dashboard
+
+  MetricNamespace:
+    Type: String
+    Default: SecurityOperations
+
+  SnapshotSchedule:
+    Type: String
+    Default: rate(5 minutes)
+    Description: Refresh interval for optimized Security Hub Insights metrics.
+
+  IamSnapshotSchedule:
+    Type: String
+    Default: rate(6 hours)
+    Description: Refresh interval for IAM Credential Report posture metrics.
+
+  FindingsDetailSchedule:
+    Type: String
+    Default: rate(15 minutes)
+    Description: Refresh interval for operational HIGH/CRITICAL finding details.
+
+  MaxOperationalFindings:
+    Type: Number
+    Default: 500
+    MinValue: 50
+    MaxValue: 1000
+    Description: Maximum active CRITICAL/HIGH findings written per detail refresh.
+
+  AccessKeyWarningDays:
+    Type: Number
+    Default: 75
+    MinValue: 1
+    MaxValue: 89
+
+  AccessKeyCriticalDays:
+    Type: Number
+    Default: 90
+    MinValue: 2
+    MaxValue: 3650
+
+  UnusedCredentialDays:
+    Type: Number
+    Default: 90
+    MinValue: 1
+    MaxValue: 3650
+
+  FindingDedupHours:
+    Type: Number
+    Default: 24
+    MinValue: 1
+    MaxValue: 720
+
+  IamAlertDedupHours:
+    Type: Number
+    Default: 168
+    MinValue: 1
+    MaxValue: 2160
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+
+Resources:
+
+  SecurityAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: security-operations-alerts
+      DisplayName: Security Operations Alerts
+
+  SecurityAlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+      TopicArn: !Ref SecurityAlertsTopic
+
+  SecurityMetricsDedupTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: FindingId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: FindingId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ExpiresAt
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Name
+          Value: security-findings-notification-dedup-v2
+        - Key: Purpose
+          Value: SecurityOperations
+
+  SecurityMetricsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/security-operations-collector
+      RetentionInDays: 30
+
+  OperationalFindingsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/security/operations/findings
+      RetentionInDays: 30
+
+  IamOperationsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/security/operations/iam
+      RetentionInDays: 30
+
+  ActiveFindingsBySeverityInsight:
+    Type: AWS::SecurityHub::Insight
+    Properties:
+      Name: SecurityOps-Active-Findings-By-Severity
+      GroupByAttribute: SeverityLabel
+      Filters:
+        RecordState:
+          - Value: ACTIVE
+            Comparison: EQUALS
+        WorkflowStatus:
+          - Value: NEW
+            Comparison: EQUALS
+          - Value: NOTIFIED
+            Comparison: EQUALS
+
+  GuardDutyBySeverityInsight:
+    Type: AWS::SecurityHub::Insight
+    Properties:
+      Name: SecurityOps-GuardDuty-By-Severity
+      GroupByAttribute: SeverityLabel
+      Filters:
+        RecordState:
+          - Value: ACTIVE
+            Comparison: EQUALS
+        WorkflowStatus:
+          - Value: NEW
+            Comparison: EQUALS
+          - Value: NOTIFIED
+            Comparison: EQUALS
+        ProductArn:
+          - Value: !Sub arn:${AWS::Partition}:securityhub:${AWS::Region}::product/aws/guardduty
+            Comparison: EQUALS
+
+  FailedControlsBySeverityInsight:
+    Type: AWS::SecurityHub::Insight
+    Properties:
+      Name: SecurityOps-Failed-Controls-By-Severity
+      GroupByAttribute: SeverityLabel
+      Filters:
+        RecordState:
+          - Value: ACTIVE
+            Comparison: EQUALS
+        WorkflowStatus:
+          - Value: NEW
+            Comparison: EQUALS
+          - Value: NOTIFIED
+            Comparison: EQUALS
+        ComplianceStatus:
+          - Value: FAILED
+            Comparison: EQUALS
+
+  HighCriticalByResourceTypeInsight:
+    Type: AWS::SecurityHub::Insight
+    Properties:
+      Name: SecurityOps-High-Critical-By-ResourceType
+      GroupByAttribute: ResourceType
+      Filters:
+        RecordState:
+          - Value: ACTIVE
+            Comparison: EQUALS
+        WorkflowStatus:
+          - Value: NEW
+            Comparison: EQUALS
+          - Value: NOTIFIED
+            Comparison: EQUALS
+        SeverityLabel:
+          - Value: CRITICAL
+            Comparison: EQUALS
+          - Value: HIGH
+            Comparison: EQUALS
+
+  SecurityMetricsLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub security-operations-collector-role-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: SecurityMetricsV2LeastPrivilege
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+
+              - Sid: WriteSecurityOperationalLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/security-operations-collector:*
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/security/operations/findings:*
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/security/operations/iam:*
+
+              - Sid: ReadSecurityHubInsightResultsCurrentRegion
+                Effect: Allow
+                Action:
+                  - securityhub:GetInsightResults
+                Resource:
+                  - !Ref ActiveFindingsBySeverityInsight
+                  - !Ref GuardDutyBySeverityInsight
+                  - !Ref FailedControlsBySeverityInsight
+                  - !Ref HighCriticalByResourceTypeInsight
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref AWS::Region
+
+              - Sid: ReadPriorityFindingDetailsCurrentRegion
+                Effect: Allow
+                Action:
+                  - securityhub:GetFindings
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref AWS::Region
+
+              - Sid: ReadIamCredentialPosture
+                Effect: Allow
+                Action:
+                  - iam:GenerateCredentialReport
+                  - iam:GetCredentialReport
+                  - iam:ListUsers
+                  - iam:ListAccessKeys
+                  - iam:GetAccessKeyLastUsed
+                Resource: '*'
+
+              - Sid: PublishOnlySecurityNamespace
+                Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: !Ref MetricNamespace
+
+              - Sid: PublishOnlyConfiguredTopic
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SecurityAlertsTopic
+
+              - Sid: DeduplicateNotifications
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt SecurityMetricsDedupTable.Arn
+
+  SecurityMetricsLambda:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - SecurityMetricsLogGroup
+      - OperationalFindingsLogGroup
+      - IamOperationsLogGroup
+    Properties:
+      FunctionName: security-operations-collector
+      Description: >-
+        Read-only security operations collector. Uses Security Hub Insights instead of paginating thousands
+        of findings, plus IAM Credential Report posture metrics and SNS notifications.
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt SecurityMetricsLambdaRole.Arn
+      Timeout: 90
+      MemorySize: 256
+      Environment:
+        Variables:
+          METRIC_NAMESPACE: !Ref MetricNamespace
+          SNS_TOPIC_ARN: !Ref SecurityAlertsTopic
+          DEDUP_TABLE: !Ref SecurityMetricsDedupTable
+          FINDING_DEDUP_HOURS: !Ref FindingDedupHours
+          IAM_ALERT_DEDUP_HOURS: !Ref IamAlertDedupHours
+          ACCESS_KEY_WARNING_DAYS: !Ref AccessKeyWarningDays
+          ACCESS_KEY_CRITICAL_DAYS: !Ref AccessKeyCriticalDays
+          UNUSED_CREDENTIAL_DAYS: !Ref UnusedCredentialDays
+          ACTIVE_FINDINGS_INSIGHT_ARN: !Ref ActiveFindingsBySeverityInsight
+          GUARDDUTY_INSIGHT_ARN: !Ref GuardDutyBySeverityInsight
+          FAILED_CONTROLS_INSIGHT_ARN: !Ref FailedControlsBySeverityInsight
+          HIGH_CRITICAL_RESOURCE_INSIGHT_ARN: !Ref HighCriticalByResourceTypeInsight
+          MAX_OPERATIONAL_FINDINGS: !Ref MaxOperationalFindings
+          FINDINGS_LOG_GROUP: !Ref OperationalFindingsLogGroup
+          IAM_LOG_GROUP: !Ref IamOperationsLogGroup
+      Code:
+        ZipFile: |
+          import boto3
+          import csv
+          import io
+          import json
+          import os
+          import time
+          from collections import Counter
+          from datetime import datetime, timezone
+          from botocore.exceptions import ClientError
+
+          securityhub = boto3.client("securityhub")
+          iam = boto3.client("iam")
+          cloudwatch = boto3.client("cloudwatch")
+          sns = boto3.client("sns")
+          dynamodb = boto3.client("dynamodb")
+
+          NAMESPACE = os.environ["METRIC_NAMESPACE"]
+          SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
+          DEDUP_TABLE = os.environ["DEDUP_TABLE"]
+
+          FINDING_DEDUP_HOURS = int(os.environ.get("FINDING_DEDUP_HOURS", "24"))
+          IAM_ALERT_DEDUP_HOURS = int(os.environ.get("IAM_ALERT_DEDUP_HOURS", "168"))
+          WARNING_DAYS = int(os.environ.get("ACCESS_KEY_WARNING_DAYS", "75"))
+          CRITICAL_DAYS = int(os.environ.get("ACCESS_KEY_CRITICAL_DAYS", "90"))
+          UNUSED_DAYS = int(os.environ.get("UNUSED_CREDENTIAL_DAYS", "90"))
+
+          ACTIVE_FINDINGS_INSIGHT_ARN = os.environ["ACTIVE_FINDINGS_INSIGHT_ARN"]
+          GUARDDUTY_INSIGHT_ARN = os.environ["GUARDDUTY_INSIGHT_ARN"]
+          FAILED_CONTROLS_INSIGHT_ARN = os.environ["FAILED_CONTROLS_INSIGHT_ARN"]
+          HIGH_CRITICAL_RESOURCE_INSIGHT_ARN = os.environ["HIGH_CRITICAL_RESOURCE_INSIGHT_ARN"]
+          MAX_OPERATIONAL_FINDINGS = int(os.environ.get("MAX_OPERATIONAL_FINDINGS", "500"))
+          FINDINGS_LOG_GROUP = os.environ["FINDINGS_LOG_GROUP"]
+          IAM_LOG_GROUP = os.environ["IAM_LOG_GROUP"]
+          logs_client = boto3.client("logs")
+
+          SEVERITIES = ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
+          CATEGORIES = ["EKS", "EC2", "ECR", "IAM", "S3", "GUARDDUTY", "OTHER"]
+
+          def metric(name, value, dimensions=None):
+              datum = {
+                  "MetricName": name,
+                  "Value": float(value),
+                  "Unit": "Count"
+              }
+              if dimensions:
+                  datum["Dimensions"] = [
+                      {"Name": str(k), "Value": str(v)}
+                      for k, v in dimensions.items()
+                  ]
+              return datum
+
+          def put_metrics(items):
+              if not items:
+                  return
+              # Stay well below PutMetricData API limits.
+              for i in range(0, len(items), 500):
+                  cloudwatch.put_metric_data(
+                      Namespace=NAMESPACE,
+                      MetricData=items[i:i+500]
+                  )
+
+          def parse_bool(value):
+              return str(value).lower() == "true"
+
+          def parse_iam_date(value):
+              if not value or value in ("N/A", "no_information"):
+                  return None
+              try:
+                  return datetime.fromisoformat(value.replace("Z", "+00:00"))
+              except Exception:
+                  return None
+
+          def age_days(value, now):
+              dt = parse_iam_date(value)
+              if not dt:
+                  return None
+              return max(0, int((now - dt).total_seconds() // 86400))
+
+          def write_structured_logs(log_group, stream_name, records):
+              if not records:
+                  return
+              try:
+                  logs_client.create_log_stream(
+                      logGroupName=log_group,
+                      logStreamName=stream_name
+                  )
+              except ClientError as exc:
+                  if exc.response.get("Error", {}).get("Code") != "ResourceAlreadyExistsException":
+                      raise
+
+              now_ms = int(time.time() * 1000)
+              events = [
+                  {
+                      "timestamp": now_ms + idx,
+                      "message": json.dumps(record, default=str)
+                  }
+                  for idx, record in enumerate(records)
+              ]
+              for i in range(0, len(events), 100):
+                  logs_client.put_log_events(
+                      logGroupName=log_group,
+                      logStreamName=stream_name,
+                      logEvents=events[i:i+100]
+                  )
+
+          def reserve_notification(key, ttl_hours):
+              if not key:
+                  return True
+              expires_at = int(time.time()) + (int(ttl_hours) * 3600)
+              try:
+                  dynamodb.put_item(
+                      TableName=DEDUP_TABLE,
+                      Item={
+                          "FindingId": {"S": key},
+                          "ExpiresAt": {"N": str(expires_at)}
+                      },
+                      ConditionExpression="attribute_not_exists(FindingId)"
+                  )
+                  return True
+              except ClientError as exc:
+                  if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                      return False
+                  raise
+
+          def publish_alert(subject, payload):
+              sns.publish(
+                  TopicArn=SNS_TOPIC_ARN,
+                  Subject=subject[:100],
+                  Message=json.dumps(payload, indent=2, default=str)
+              )
+
+          def classify_resource_type(resource_type):
+              text = (resource_type or "").upper()
+              if "EKS" in text:
+                  return "EKS"
+              if "EC2" in text or "SECURITYGROUP" in text or "SECURITY-GROUP" in text:
+                  return "EC2"
+              if "ECR" in text:
+                  return "ECR"
+              if "IAM" in text:
+                  return "IAM"
+              if "S3" in text:
+                  return "S3"
+              return "OTHER"
+
+          def get_insight_counts(insight_arn):
+              response = securityhub.get_insight_results(InsightArn=insight_arn)
+              values = response.get("InsightResults", {}).get("ResultValues", [])
+              return {
+                  item.get("GroupByAttributeValue", "UNKNOWN"): int(item.get("Count", 0))
+                  for item in values
+              }
+
+          def securityhub_snapshot():
+              severity_raw = get_insight_counts(ACTIVE_FINDINGS_INSIGHT_ARN)
+              guardduty_raw = get_insight_counts(GUARDDUTY_INSIGHT_ARN)
+              failed_raw = get_insight_counts(FAILED_CONTROLS_INSIGHT_ARN)
+              resource_type_raw = get_insight_counts(HIGH_CRITICAL_RESOURCE_INSIGHT_ARN)
+
+              severity_counts = Counter({
+                  sev: severity_raw.get(sev, 0)
+                  for sev in SEVERITIES
+              })
+              guardduty_severity = Counter({
+                  sev: guardduty_raw.get(sev, 0)
+                  for sev in SEVERITIES
+              })
+
+              active_total = sum(severity_raw.values())
+              guardduty_total = sum(guardduty_raw.values())
+              failed_controls = sum(failed_raw.values())
+
+              category_hc_counts = Counter()
+              for resource_type, count in resource_type_raw.items():
+                  category_hc_counts[classify_resource_type(resource_type)] += count
+
+              metrics = [
+                  metric("ActiveFindingsTotal", active_total),
+                  metric("ActiveGuardDutyFindings", guardduty_total),
+                  metric("FailedSecurityControls", failed_controls)
+              ]
+
+              for sev in SEVERITIES:
+                  metrics.append(metric(
+                      "ActiveFindings",
+                      severity_counts[sev],
+                      {"Severity": sev}
+                  ))
+                  metrics.append(metric(
+                      "ActiveGuardDutyFindingsBySeverity",
+                      guardduty_severity[sev],
+                      {"Severity": sev}
+                  ))
+
+              for category in CATEGORIES:
+                  metrics.append(metric(
+                      "HighCriticalFindingsByCategory",
+                      category_hc_counts[category],
+                      {"Category": category}
+                  ))
+
+              return metrics, {
+                  "mode": "SecurityHubInsights",
+                  "active_total": active_total,
+                  "severity": dict(severity_counts),
+                  "guardduty_total": guardduty_total,
+                  "guardduty_severity": dict(guardduty_severity),
+                  "failed_controls": failed_controls,
+                  "high_critical_by_category": dict(category_hc_counts),
+                  "resource_types_seen": len(resource_type_raw)
+              }
+
+          def get_credential_report():
+              # IAM returns an existing report if it is fresh enough; otherwise starts generation.
+              for _ in range(6):
+                  response = iam.generate_credential_report()
+                  state = response.get("State")
+                  if state == "COMPLETE":
+                      report = iam.get_credential_report()
+                      content = report["Content"].decode("utf-8")
+                      return list(csv.DictReader(io.StringIO(content)))
+                  if state == "STARTED":
+                      time.sleep(2)
+                      continue
+                  time.sleep(2)
+              report = iam.get_credential_report()
+              content = report["Content"].decode("utf-8")
+              return list(csv.DictReader(io.StringIO(content)))
+
+          def iam_snapshot():
+              now = datetime.now(timezone.utc)
+              rows = get_credential_report()
+              report_by_user = {row.get("user", ""): row for row in rows}
+
+              active_keys = 0
+              warning_keys = 0
+              critical_keys = 0
+              unused_keys = 0
+              console_users_without_mfa = 0
+              root_access_keys = 0
+              root_mfa_missing = 0
+              users_with_console_password = 0
+
+              iam_alerts = []
+              key_records = []
+              user_records = []
+
+              root_row = report_by_user.get("<root_account>", {})
+              if root_row:
+                  root_mfa_missing = 0 if parse_bool(root_row.get("mfa_active")) else 1
+                  for slot in ("1", "2"):
+                      if parse_bool(root_row.get(f"access_key_{slot}_active")):
+                          root_access_keys += 1
+                          active_keys += 1
+
+              paginator = iam.get_paginator("list_users")
+              for page in paginator.paginate():
+                  for user_info in page.get("Users", []):
+                      username = user_info["UserName"]
+                      row = report_by_user.get(username, {})
+                      password_enabled = parse_bool(row.get("password_enabled"))
+                      mfa_active = parse_bool(row.get("mfa_active"))
+
+                      if password_enabled:
+                          users_with_console_password += 1
+                      if password_enabled and not mfa_active:
+                          console_users_without_mfa += 1
+
+                      user_records.append({
+                          "record_type": "IAM_USER_DETAIL",
+                          "user": username,
+                          "arn": user_info.get("Arn", ""),
+                          "user_created": user_info.get("CreateDate"),
+                          "password_enabled": password_enabled,
+                          "mfa_active": mfa_active,
+                          "mfa_status": "MFA_OK" if mfa_active else ("NO_MFA" if password_enabled else "NO_CONSOLE"),
+                          "password_last_used": row.get("password_last_used", ""),
+                          "snapshot_at": now.isoformat()
+                      })
+
+                      key_page = iam.list_access_keys(UserName=username)
+                      for key_meta in key_page.get("AccessKeyMetadata", []):
+                          if key_meta.get("Status") != "Active":
+                              continue
+
+                          access_key_id = key_meta["AccessKeyId"]
+                          create_date = key_meta.get("CreateDate")
+                          key_age = max(0, int((now - create_date).total_seconds() // 86400)) if create_date else None
+
+                          last_used_response = iam.get_access_key_last_used(
+                              AccessKeyId=access_key_id
+                          ).get("AccessKeyLastUsed", {})
+                          last_used_date = last_used_response.get("LastUsedDate")
+                          unused_days = (
+                              max(0, int((now - last_used_date).total_seconds() // 86400))
+                              if last_used_date else key_age
+                          )
+                          never_used = last_used_date is None
+
+                          if key_age is not None and key_age >= CRITICAL_DAYS:
+                              age_bucket = "AGE_90_PLUS"
+                              critical_keys += 1
+                          elif key_age is not None and key_age >= WARNING_DAYS:
+                              age_bucket = "AGE_75_89"
+                              warning_keys += 1
+                          else:
+                              age_bucket = "AGE_OK"
+
+                          is_unused = unused_days is not None and unused_days >= UNUSED_DAYS
+                          unused_bucket = "UNUSED_90_PLUS" if is_unused else "USED_RECENTLY"
+
+                          active_keys += 1
+                          if is_unused:
+                              unused_keys += 1
+
+                          key_records.append({
+                              "record_type": "IAM_KEY_DETAIL",
+                              "user": username,
+                              "access_key_id": access_key_id,
+                              "key_status": key_meta.get("Status", ""),
+                              "created_at": create_date,
+                              "key_age_days": key_age,
+                              "age_bucket": age_bucket,
+                              "last_used_at": last_used_date,
+                              "unused_days": unused_days,
+                              "unused_bucket": unused_bucket,
+                              "never_used": never_used,
+                              "last_used_service": last_used_response.get("ServiceName", ""),
+                              "last_used_region": last_used_response.get("Region", ""),
+                              "mfa_active": mfa_active,
+                              "password_enabled": password_enabled,
+                              "snapshot_at": now.isoformat()
+                          })
+
+                          if age_bucket == "AGE_90_PLUS":
+                              iam_alerts.append({
+                                  "type": "ACCESS_KEY_OVER_CRITICAL_AGE",
+                                  "severity": "HIGH",
+                                  "user": username,
+                                  "access_key_id": access_key_id,
+                                  "age_days": key_age,
+                                  "threshold_days": CRITICAL_DAYS
+                              })
+                          elif age_bucket == "AGE_75_89":
+                              iam_alerts.append({
+                                  "type": "ACCESS_KEY_WARNING_AGE",
+                                  "severity": "MEDIUM",
+                                  "user": username,
+                                  "access_key_id": access_key_id,
+                                  "age_days": key_age,
+                                  "threshold_days": WARNING_DAYS
+                              })
+
+                          if is_unused:
+                              iam_alerts.append({
+                                  "type": "ACCESS_KEY_UNUSED",
+                                  "severity": "HIGH",
+                                  "user": username,
+                                  "access_key_id": access_key_id,
+                                  "last_used_age_days": unused_days,
+                                  "never_used": never_used,
+                                  "threshold_days": UNUSED_DAYS
+                              })
+
+              metrics = [
+                  metric("IAMActiveAccessKeys", active_keys),
+                  metric("IAMAccessKeysWarningAge", warning_keys),
+                  metric("IAMAccessKeysCriticalAge", critical_keys),
+                  metric("IAMAccessKeysUnused", unused_keys),
+                  metric("IAMConsoleUsersWithoutMFA", console_users_without_mfa),
+                  metric("IAMRootAccessKeys", root_access_keys),
+                  metric("IAMRootMFAMissing", root_mfa_missing),
+                  metric("IAMConsolePasswordUsers", users_with_console_password)
+              ]
+
+              write_structured_logs(IAM_LOG_GROUP, "access-keys", key_records)
+              write_structured_logs(IAM_LOG_GROUP, "users", user_records)
+
+              for alert in iam_alerts:
+                  alert_id = alert.get("access_key_id", "unknown")
+                  key = f"iam:{alert['type']}:{alert['user']}:{alert_id}"
+                  if reserve_notification(key, IAM_ALERT_DEDUP_HOURS):
+                      subject = "[AWS Security][IAM][{severity}] {type}".format(**alert)
+                      publish_alert(subject, alert)
+
+              if root_access_keys > 0:
+                  if reserve_notification("iam:root:access-keys", IAM_ALERT_DEDUP_HOURS):
+                      publish_alert(
+                          "[AWS Security][IAM][CRITICAL] Root access key activa",
+                          {"type": "ROOT_ACCESS_KEY_ACTIVE", "severity": "CRITICAL", "count": root_access_keys}
+                      )
+
+              if root_mfa_missing > 0:
+                  if reserve_notification("iam:root:mfa-missing", IAM_ALERT_DEDUP_HOURS):
+                      publish_alert(
+                          "[AWS Security][IAM][CRITICAL] Root sin MFA",
+                          {"type": "ROOT_MFA_MISSING", "severity": "CRITICAL"}
+                      )
+
+              return metrics, {
+                  "active_access_keys": active_keys,
+                  "warning_age_keys": warning_keys,
+                  "critical_age_keys": critical_keys,
+                  "unused_keys": unused_keys,
+                  "console_users_without_mfa": console_users_without_mfa,
+                  "root_access_keys": root_access_keys,
+                  "root_mfa_missing": root_mfa_missing,
+                  "key_detail_records": len(key_records),
+                  "user_detail_records": len(user_records)
+              }
+
+          def extract_control_id(finding):
+              compliance = finding.get("Compliance", {}) or {}
+              control_id = compliance.get("SecurityControlId")
+              if control_id:
+                  return control_id
+
+              generator = finding.get("GeneratorId", "") or ""
+              if "/" in generator:
+                  return generator.split("/")[-1]
+              return ""
+
+          def finding_detail_record(finding):
+              resources = finding.get("Resources", []) or []
+              first_resource = resources[0] if resources else {}
+              remediation = (
+                  finding.get("Remediation", {})
+                  .get("Recommendation", {})
+              )
+
+              severity = finding.get("Severity", {}).get("Label", "UNKNOWN")
+              severity_rank = {
+                  "CRITICAL": 1,
+                  "HIGH": 2,
+                  "MEDIUM": 3,
+                  "LOW": 4,
+                  "INFORMATIONAL": 5
+              }.get(severity, 9)
+
+              return {
+                  "record_type": "FINDING_DETAIL",
+                  "finding_id": finding.get("Id", ""),
+                  "severity": severity,
+                  "severity_rank": severity_rank,
+                  "product": finding.get("ProductName", ""),
+                  "control_id": extract_control_id(finding),
+                  "title": finding.get("Title", ""),
+                  "resource_id": first_resource.get("Id", ""),
+                  "resource_type": first_resource.get("Type", ""),
+                  "compliance": finding.get("Compliance", {}).get("Status", ""),
+                  "workflow": finding.get("Workflow", {}).get("Status", ""),
+                  "record_state": finding.get("RecordState", ""),
+                  "updated_at": finding.get("UpdatedAt", ""),
+                  "first_observed_at": finding.get("FirstObservedAt", ""),
+                  "remediation": remediation.get("Text", ""),
+                  "remediation_url": remediation.get("Url", ""),
+                  "description": finding.get("Description", "")
+              }
+
+          def emit_finding_detail(finding):
+              write_structured_logs(
+                  FINDINGS_LOG_GROUP,
+                  "realtime-findings",
+                  [finding_detail_record(finding)]
+              )
+
+          def refresh_operational_findings():
+              filters = {
+                  "RecordState": [{"Value": "ACTIVE", "Comparison": "EQUALS"}],
+                  "WorkflowStatus": [
+                      {"Value": "NEW", "Comparison": "EQUALS"},
+                      {"Value": "NOTIFIED", "Comparison": "EQUALS"}
+                  ],
+                  "SeverityLabel": [
+                      {"Value": "CRITICAL", "Comparison": "EQUALS"},
+                      {"Value": "HIGH", "Comparison": "EQUALS"}
+                  ]
+              }
+
+              records = []
+              next_token = None
+              while len(records) < MAX_OPERATIONAL_FINDINGS:
+                  params = {
+                      "Filters": filters,
+                      "SortCriteria": [{"Field": "UpdatedAt", "SortOrder": "desc"}],
+                      "MaxResults": min(100, MAX_OPERATIONAL_FINDINGS - len(records))
+                  }
+                  if next_token:
+                      params["NextToken"] = next_token
+
+                  response = securityhub.get_findings(**params)
+                  findings = response.get("Findings", [])
+                  for finding in findings:
+                      records.append(finding_detail_record(finding))
+                      if len(records) >= MAX_OPERATIONAL_FINDINGS:
+                          break
+
+                  next_token = response.get("NextToken")
+                  if not next_token or not findings:
+                      break
+
+              write_structured_logs(FINDINGS_LOG_GROUP, "priority-findings", records)
+              return {"emitted": len(records), "max_configured": MAX_OPERATIONAL_FINDINGS}
+
+          def handle_finding_event(event):
+              findings = event.get("detail", {}).get("findings", [])
+              if isinstance(findings, dict):
+                  findings = [findings]
+
+              processed = 0
+              notified = 0
+              event_metrics = []
+
+              for finding in findings:
+                  severity = finding.get("Severity", {}).get("Label", "UNKNOWN")
+                  if severity not in ("CRITICAL", "HIGH"):
+                      continue
+
+                  record_state = finding.get("RecordState", "ACTIVE")
+                  workflow = finding.get("Workflow", {}).get("Status", "NEW")
+                  if record_state != "ACTIVE" or workflow not in ("NEW", "NOTIFIED"):
+                      continue
+
+                  finding_id = finding.get("Id", "")
+                  product = finding.get("ProductName", "UNKNOWN")
+                  title = finding.get("Title", "Security finding")
+                  resources = [r.get("Id", "") for r in finding.get("Resources", [])]
+
+                  processed += 1
+                  emit_finding_detail(finding)
+                  event_metrics.append(metric(
+                      "HighCriticalFindingEvents", 1, {"Severity": severity}
+                  ))
+
+                  if product == "GuardDuty":
+                      event_metrics.append(metric(
+                          "GuardDutyThreatEvents", 1, {"Severity": severity}
+                      ))
+
+                  if not reserve_notification(
+                      "finding:" + finding_id,
+                      FINDING_DEDUP_HOURS
+                  ):
+                      continue
+
+                  message = {
+                      "severity": severity,
+                      "product": product,
+                      "title": title,
+                      "finding_id": finding_id,
+                      "resources": resources,
+                      "region": event.get("region"),
+                      "account": event.get("account"),
+                      "created_at": finding.get("CreatedAt"),
+                      "updated_at": finding.get("UpdatedAt"),
+                      "workflow": workflow,
+                      "record_state": record_state
+                  }
+
+                  publish_alert(
+                      f"[AWS Security][{severity}] {title}",
+                      message
+                  )
+                  notified += 1
+
+              put_metrics(event_metrics)
+              return {"processed": processed, "notified": notified}
+
+          def securityhub_snapshot_only():
+              sh_metrics, sh_summary = securityhub_snapshot()
+              put_metrics(sh_metrics)
+              return sh_summary
+
+          def iam_snapshot_only():
+              iam_metrics, iam_summary = iam_snapshot()
+              put_metrics(iam_metrics)
+              return iam_summary
+
+          def full_snapshot():
+              return {
+                  "securityhub": securityhub_snapshot_only(),
+                  "iam": iam_snapshot_only()
+              }
+
+          def lambda_handler(event, context):
+              mode = event.get("mode")
+
+              if mode == "securityhub_snapshot":
+                  return {
+                      "mode": "securityhub_snapshot",
+                      "result": securityhub_snapshot_only()
+                  }
+
+              if mode == "iam_snapshot":
+                  return {
+                      "mode": "iam_snapshot",
+                      "result": iam_snapshot_only()
+                  }
+
+              if mode == "findings_detail":
+                  return {
+                      "mode": "findings_detail",
+                      "result": refresh_operational_findings()
+                  }
+
+              if mode == "snapshot":
+                  return {
+                      "mode": "snapshot",
+                      "result": full_snapshot()
+                  }
+
+              if event.get("source") == "aws.securityhub":
+                  return {
+                      "mode": "finding",
+                      "result": handle_finding_event(event)
+                  }
+
+              # Backward compatibility if a schedule invokes without custom input.
+              if (
+                  event.get("source") == "aws.events"
+                  and event.get("detail-type") == "Scheduled Event"
+              ):
+                  return {
+                      "mode": "securityhub_snapshot",
+                      "result": securityhub_snapshot_only()
+                  }
+
+              return {"mode": "ignored"}
+
+  SecurityHubHighCriticalRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: security-hub-v2-high-critical-findings
+      Description: Routes ACTIVE HIGH and CRITICAL Security Hub CSPM findings to the Lambda.
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.securityhub
+        detail-type:
+          - Security Hub Findings - Imported
+        detail:
+          findings:
+            RecordState:
+              - ACTIVE
+            Severity:
+              Label:
+                - CRITICAL
+                - HIGH
+      Targets:
+        - Arn: !GetAtt SecurityMetricsLambda.Arn
+          Id: SecurityMetricsLambda
+
+  SecuritySnapshotScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: security-operations-v2-snapshot
+      Description: Refreshes optimized Security Hub Insight metrics.
+      ScheduleExpression: !Ref SnapshotSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt SecurityMetricsLambda.Arn
+          Id: SecurityMetricsSnapshotLambda
+          Input: '{"mode":"securityhub_snapshot"}'
+
+  IamSnapshotScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: security-operations-v2-iam-snapshot
+      Description: Refreshes IAM credential posture metrics independently.
+      ScheduleExpression: !Ref IamSnapshotSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt SecurityMetricsLambda.Arn
+          Id: IamSecurityMetricsSnapshotLambda
+          Input: '{"mode":"iam_snapshot"}'
+
+  FindingsDetailScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: security-operations-v2-findings-detail
+      Description: Refreshes HIGH/CRITICAL finding details for the operational dashboard table.
+      ScheduleExpression: !Ref FindingsDetailSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt SecurityMetricsLambda.Arn
+          Id: FindingsDetailLambda
+          Input: '{"mode":"findings_detail"}'
+
+  AllowEventBridgeHighCriticalInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SecurityMetricsLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SecurityHubHighCriticalRule.Arn
+
+  AllowEventBridgeSnapshotInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SecurityMetricsLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SecuritySnapshotScheduleRule.Arn
+
+  AllowEventBridgeIamSnapshotInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SecurityMetricsLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt IamSnapshotScheduleRule.Arn
+
+  AllowEventBridgeFindingsDetailInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SecurityMetricsLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt FindingsDetailScheduleRule.Arn
+
+  SecurityOperationsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Ref DashboardName
+      DashboardBody: !Sub |
+        {
+          "start": "-PT24H",
+          "periodOverride": "inherit",
+          "variables": [
+            {
+              "type": "pattern",
+              "pattern": "__SEVERITY__",
+              "inputType": "select",
+              "id": "severityDetail",
+              "label": "Severidad",
+              "visible": true,
+              "defaultValue": "HIGH",
+              "values": [
+                {"label": "Critical", "value": "CRITICAL"},
+                {"label": "High", "value": "HIGH"},
+                {"label": "Medium", "value": "MEDIUM"},
+                {"label": "Low", "value": "LOW"}
+              ]
+            },
+            {
+              "type": "pattern",
+              "pattern": "__IAM_REGEX__",
+              "inputType": "select",
+              "id": "iamRegex",
+              "label": "Filtro Access Keys",
+              "visible": true,
+              "defaultValue": ".*",
+              "values": [
+                {"label": "Todas", "value": ".*"},
+                {"label": "OK <75 días", "value": "^AGE_OK$"},
+                {"label": "75-89 días", "value": "^AGE_75_89$"},
+                {"label": ">=90 días", "value": "^AGE_90_PLUS$"},
+                {"label": "Sin uso >=90 días", "value": "^UNUSED_90_PLUS$"}
+              ]
+            }
+          ],
+          "widgets": [
+            {
+              "type": "text",
+              "x": 0, "y": 0, "width": 24, "height": 2,
+              "properties": {
+                "markdown": "# AWS Security Operations Dashboard\n**Security Hub Insights + GuardDuty + IAM Credential Posture**\n\n🔴 **CRITICAL** atención inmediata  |  🟠 **HIGH** prioridad alta  |  🟡 **MEDIUM/WARNING** seguimiento  |  🟢 **LOW/OK** controlado  |  **Region:** ${AWS::Region}  |  **SNS:** `${SecurityAlertsTopic}`"
+              }
+            },
+
+            {
+              "type": "metric",
+              "x": 0, "y": 2, "width": 6, "height": 4,
+              "properties": {
+                "metrics": [["${MetricNamespace}", "ActiveFindings", "Severity", "CRITICAL"]],
+                "view": "singleValue",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Maximum",
+                "title": "CRITICAL activos",
+                "sparkline": false,
+                "liveData": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 6, "y": 2, "width": 6, "height": 4,
+              "properties": {
+                "metrics": [["${MetricNamespace}", "ActiveFindings", "Severity", "HIGH"]],
+                "view": "singleValue",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Maximum",
+                "title": "HIGH activos",
+                "sparkline": false,
+                "liveData": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 2, "width": 6, "height": 4,
+              "properties": {
+                "metrics": [["${MetricNamespace}", "ActiveFindings", "Severity", "MEDIUM"]],
+                "view": "singleValue",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Maximum",
+                "title": "MEDIUM activos",
+                "sparkline": false,
+                "liveData": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 18, "y": 2, "width": 6, "height": 4,
+              "properties": {
+                "metrics": [["${MetricNamespace}", "ActiveFindings", "Severity", "LOW"]],
+                "view": "singleValue",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Maximum",
+                "title": "LOW activos",
+                "sparkline": false,
+                "liveData": false
+              }
+            },
+
+            {
+              "type": "text",
+              "x": 0, "y": 6, "width": 24, "height": 1,
+              "properties": {
+                "markdown": "## Threat Detection & Security Posture"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 7, "width": 8, "height": 5,
+              "properties": {
+                "metrics": [["${MetricNamespace}", "ActiveFindingsTotal"]],
+                "view": "singleValue",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Maximum",
+                "title": "Security Hub - Findings activos",
+                "sparkline": true,
+                "liveData": true
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8, "y": 7, "width": 8, "height": 5,
+              "properties": {
+                "metrics": [["${MetricNamespace}", "ActiveGuardDutyFindings"]],
+                "view": "singleValue",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Maximum",
+                "title": "GuardDuty - Findings activos",
+                "sparkline": true,
+                "liveData": true
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16, "y": 7, "width": 8, "height": 5,
+              "properties": {
+                "metrics": [["${MetricNamespace}", "FailedSecurityControls"]],
+                "view": "singleValue",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Maximum",
+                "title": "Security Hub - Controles FAILED",
+                "sparkline": true,
+                "liveData": true
+              }
+            },
+
+            {
+              "type": "metric",
+              "x": 0, "y": 12, "width": 12, "height": 6,
+              "properties": {
+                "metrics": [
+                  ["${MetricNamespace}", "ActiveFindings", "Severity", "CRITICAL", {"label": "CRITICAL", "color": "#d13212"}],
+                  [".", ".", ".", "HIGH", {"label": "HIGH", "color": "#ff7f0e"}],
+                  [".", ".", ".", "MEDIUM", {"label": "MEDIUM", "color": "#f2c811"}],
+                  [".", ".", ".", "LOW", {"label": "LOW", "color": "#2ca02c"}]
+                ],
+                "view": "bar",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Maximum",
+                "title": "Findings activos por severidad"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 12, "width": 12, "height": 6,
+              "properties": {
+                "metrics": [
+                  ["${MetricNamespace}", "HighCriticalFindingsByCategory", "Category", "EKS", {"label": "EKS"}],
+                  [".", ".", ".", "EC2", {"label": "EC2"}],
+                  [".", ".", ".", "ECR", {"label": "ECR"}],
+                  [".", ".", ".", "IAM", {"label": "IAM"}],
+                  [".", ".", ".", "S3", {"label": "S3"}],
+                  [".", ".", ".", "GUARDDUTY", {"label": "GuardDuty"}],
+                  [".", ".", ".", "OTHER", {"label": "Otros"}]
+                ],
+                "view": "bar",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Maximum",
+                "title": "HIGH + CRITICAL por categoría"
+              }
+            },
+
+            {
+              "type": "metric",
+              "x": 0, "y": 18, "width": 12, "height": 5,
+              "properties": {
+                "metrics": [
+                  ["${MetricNamespace}", "ActiveGuardDutyFindingsBySeverity", "Severity", "CRITICAL", {"label": "CRITICAL", "color": "#d13212"}],
+                  [".", ".", ".", "HIGH", {"label": "HIGH", "color": "#ff7f0e"}],
+                  [".", ".", ".", "MEDIUM", {"label": "MEDIUM", "color": "#f2c811"}],
+                  [".", ".", ".", "LOW", {"label": "LOW", "color": "#2ca02c"}]
+                ],
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Maximum",
+                "title": "GuardDuty por severidad"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 18, "width": 12, "height": 5,
+              "properties": {
+                "metrics": [
+                  ["${MetricNamespace}", "HighCriticalFindingEvents", "Severity", "__SEVERITY__", {"label": "Eventos __SEVERITY__"}]
+                ],
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Sum",
+                "title": "Eventos Security Hub - selector de severidad"
+              }
+            },
+
+            {
+              "type": "text",
+              "x": 0, "y": 23, "width": 24, "height": 1,
+              "properties": {
+                "background": "solid",
+                "markdown": "## 🔴 Findings operativos — Prioridad de mitigación\nTabla dinámica de findings **ACTIVE + NEW/NOTIFIED + CRITICAL/HIGH**. Se actualiza cada 15 minutos y también recibe eventos en tiempo real."
+              }
+            },
+            {
+              "type": "log",
+              "x": 0, "y": 24, "width": 24, "height": 9,
+              "properties": {
+                "region": "${AWS::Region}",
+                "title": "🔴 CRITICAL / 🟠 HIGH activos — Qué debe mitigar el equipo",
+                "view": "table",
+                "query": "SOURCE '/aws/security/operations/findings' | fields @timestamp, severity, product, control_id, title, resource_id, resource_type, compliance, workflow, updated_at, remediation, finding_id\n| filter record_type = 'FINDING_DETAIL'\n| filter severity in ['CRITICAL','HIGH']\n| stats latest(severity) as Severidad, latest(product) as Producto, latest(control_id) as Control, latest(title) as Finding, latest(resource_id) as Recurso, latest(resource_type) as TipoRecurso, latest(compliance) as Compliance, latest(workflow) as Workflow, latest(updated_at) as Actualizado, latest(remediation) as Remediacion by finding_id\n| sort Severidad asc, Actualizado desc\n| limit 100"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0, "y": 33, "width": 24, "height": 7,
+              "properties": {
+                "region": "${AWS::Region}",
+                "title": "🔴 GuardDuty — Amenazas activas",
+                "view": "table",
+                "query": "SOURCE '/aws/security/operations/findings' | fields @timestamp, severity, title, resource_id, workflow, updated_at, description, remediation, finding_id, product\n| filter record_type = 'FINDING_DETAIL' and product = 'GuardDuty'\n| stats latest(severity) as Severidad, latest(title) as Amenaza, latest(resource_id) as Recurso, latest(workflow) as Workflow, latest(updated_at) as Actualizado, latest(description) as Descripcion, latest(remediation) as Remediacion by finding_id\n| sort Actualizado desc\n| limit 50"
+              }
+            },
+
+            {
+              "type": "text",
+              "x": 0, "y": 40, "width": 24, "height": 1,
+              "properties": {
+                "background": "solid",
+                "markdown": "## 🟠 Identity & Access — IAM Credential Posture"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 41, "width": 4, "height": 4,
+              "properties": {
+                "metrics": [["${MetricNamespace}", "IAMActiveAccessKeys", {"color": "#1f77b4"}]],
+                "view": "singleValue",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Maximum",
+                "title": "Access Keys activas",
+                "sparkline": true
+              }
+            },
+            {
+              "type": "metric",
+              "x": 4, "y": 41, "width": 5, "height": 4,
+              "properties": {
+                "metrics": [["${MetricNamespace}", "IAMAccessKeysWarningAge", {"color": "#f2c811"}]],
+                "view": "singleValue",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Maximum",
+                "title": "Keys 75-89 días",
+                "sparkline": true
+              }
+            },
+            {
+              "type": "metric",
+              "x": 9, "y": 41, "width": 5, "height": 4,
+              "properties": {
+                "metrics": [["${MetricNamespace}", "IAMAccessKeysCriticalAge", {"color": "#d13212"}]],
+                "view": "singleValue",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Maximum",
+                "title": "Keys >=90 días",
+                "sparkline": true
+              }
+            },
+            {
+              "type": "metric",
+              "x": 14, "y": 41, "width": 5, "height": 4,
+              "properties": {
+                "metrics": [["${MetricNamespace}", "IAMAccessKeysUnused", {"color": "#ff7f0e"}]],
+                "view": "singleValue",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Maximum",
+                "title": "Keys sin uso >=90d",
+                "sparkline": true
+              }
+            },
+            {
+              "type": "metric",
+              "x": 19, "y": 41, "width": 5, "height": 4,
+              "properties": {
+                "metrics": [["${MetricNamespace}", "IAMConsoleUsersWithoutMFA", {"color": "#d13212"}]],
+                "view": "singleValue",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Maximum",
+                "title": "Usuarios consola sin MFA",
+                "sparkline": true
+              }
+            },
+
+            {
+              "type": "metric",
+              "x": 0, "y": 45, "width": 6, "height": 4,
+              "properties": {
+                "metrics": [["${MetricNamespace}", "IAMRootAccessKeys", {"color": "#d13212"}]],
+                "view": "singleValue",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Maximum",
+                "title": "Root Access Keys",
+                "sparkline": true
+              }
+            },
+            {
+              "type": "metric",
+              "x": 6, "y": 45, "width": 6, "height": 4,
+              "properties": {
+                "metrics": [["${MetricNamespace}", "IAMRootMFAMissing", {"color": "#d13212"}]],
+                "view": "singleValue",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Maximum",
+                "title": "Root sin MFA",
+                "sparkline": true
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 45, "width": 6, "height": 4,
+              "properties": {
+                "metrics": [["${MetricNamespace}", "IAMConsolePasswordUsers", {"color": "#1f77b4"}]],
+                "view": "singleValue",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Maximum",
+                "title": "Usuarios con acceso consola",
+                "sparkline": true
+              }
+            },
+            {
+              "type": "text",
+              "x": 18, "y": 45, "width": 6, "height": 4,
+              "properties": {
+                "markdown": "**Política del dashboard**\n\n- Warning: `${AccessKeyWarningDays}` días\n- Critical: `${AccessKeyCriticalDays}` días\n- Sin uso: `${UnusedCredentialDays}` días\n- Security Hub: Insights cada 5 min\n- Tabla findings: cada 15 min\n- IAM: Credential Report cada 6 h\n- IAM no se modifica automáticamente"
+              }
+            },
+
+            {
+              "type": "metric",
+              "x": 0, "y": 49, "width": 12, "height": 6,
+              "properties": {
+                "metrics": [
+                  ["${MetricNamespace}", "IAMAccessKeysWarningAge", {"label": "75-89 días"}],
+                  [".", "IAMAccessKeysCriticalAge", {"label": ">=90 días"}],
+                  [".", "IAMAccessKeysUnused", {"label": "Sin uso >=90d"}]
+                ],
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Maximum",
+                "title": "Obsolescencia de Access Keys"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 49, "width": 12, "height": 6,
+              "properties": {
+                "metrics": [
+                  ["${MetricNamespace}", "IAMConsoleUsersWithoutMFA", {"label": "Usuarios sin MFA"}],
+                  [".", "IAMRootMFAMissing", {"label": "Root sin MFA"}],
+                  [".", "IAMRootAccessKeys", {"label": "Root Access Keys"}]
+                ],
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Maximum",
+                "title": "MFA y credenciales Root"
+              }
+            },
+
+            {
+              "type": "text",
+              "x": 0, "y": 55, "width": 24, "height": 1,
+              "properties": {
+                "background": "solid",
+                "markdown": "## 🟡 Detalle IAM — Access Keys y usuarios\nUsa **Filtro Access Keys** en la parte superior para mostrar Todas / <75 días / 75-89 / >=90 / Sin uso >=90. El filtro usa expresiones compatibles con Logs Insights."
+              }
+            },
+            {
+              "type": "log",
+              "x": 0, "y": 56, "width": 24, "height": 9,
+              "properties": {
+                "region": "${AWS::Region}",
+                "title": "🟡 Access Keys — Usuario, edad y último uso",
+                "view": "table",
+                "query": "SOURCE '/aws/security/operations/iam'\n| fields @timestamp, user, access_key_id, key_status, key_age_days, age_bucket, last_used_at, unused_days, unused_bucket, last_used_service, last_used_region, mfa_active\n| filter record_type = 'IAM_KEY_DETAIL'\n| filter age_bucket like /__IAM_REGEX__/ or unused_bucket like /__IAM_REGEX__/\n| sort @timestamp desc\n| dedup access_key_id\n| limit 100"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0, "y": 65, "width": 24, "height": 7,
+              "properties": {
+                "region": "${AWS::Region}",
+                "title": "🟠 Usuarios IAM — Acceso a consola y MFA",
+                "view": "table",
+                "query": "SOURCE '/aws/security/operations/iam'\n| fields @timestamp, user, password_enabled, mfa_active, mfa_status, password_last_used, user_created\n| filter record_type = 'IAM_USER_DETAIL'\n| sort @timestamp desc\n| dedup user\n| limit 100"
+              }
+            },
+            {
+              "type": "text",
+              "x": 0, "y": 72, "width": 24, "height": 1,
+              "properties": {
+                "background": "solid",
+                "markdown": "## 🟢 Operación del colector"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 73, "width": 12, "height": 5,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Errors", "FunctionName", "security-operations-collector", {"label": "Errors"}],
+                  [".", "Throttles", ".", ".", {"label": "Throttles"}]
+                ],
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Sum",
+                "title": "Lambda - Errors / Throttles"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 73, "width": 12, "height": 5,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "security-operations-collector", {"label": "Invocations"}],
+                  [".", "Duration", ".", ".", {"label": "Duration ms", "stat": "Average", "yAxis": "right"}]
+                ],
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Sum",
+                "title": "Lambda - Ejecuciones"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  DashboardName:
+    Description: CloudWatch dashboard name.
+    Value: !Ref DashboardName
+
+  DashboardUrl:
+    Description: CloudWatch dashboard console URL.
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards/dashboard/${DashboardName}
+
+  LambdaFunctionName:
+    Description: Metrics collector Lambda.
+    Value: !Ref SecurityMetricsLambda
+
+  LambdaRoleArn:
+    Description: Least-privilege Lambda role.
+    Value: !GetAtt SecurityMetricsLambdaRole.Arn
+
+  NotificationTopic:
+    Description: SNS topic created by this stack for security notifications.
+    Value: !Ref SecurityAlertsTopic
+
+  MetricNamespaceOutput:
+    Description: Custom CloudWatch namespace.
+    Value: !Ref MetricNamespace
+
+  ActiveFindingsInsightArn:
+    Description: Security Hub Insight used for active finding severity counts.
+    Value: !Ref ActiveFindingsBySeverityInsight
+
+  GuardDutyInsightArn:
+    Description: Security Hub Insight used for GuardDuty severity counts.
+    Value: !Ref GuardDutyBySeverityInsight
+
+  FailedControlsInsightArn:
+    Description: Security Hub Insight used for failed controls.
+    Value: !Ref FailedControlsBySeverityInsight
+
+  OperationalFindingsSchedule:
+    Description: EventBridge rule that refreshes operational finding details.
+    Value: !Ref FindingsDetailScheduleRule
+
+  OperationalFindingsLogGroupName:
+    Description: Dedicated log group queried by finding-detail dashboard tables.
+    Value: !Ref OperationalFindingsLogGroup
+
+  IamOperationsLogGroupName:
+    Description: Dedicated log group queried by IAM detail dashboard tables.
+    Value: !Ref IamOperationsLogGroup
