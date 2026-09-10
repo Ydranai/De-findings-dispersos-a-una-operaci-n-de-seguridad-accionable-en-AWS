@@ -346,6 +346,6 @@ Cloud & AWS enthusiast focused on:
 - Automation
 - Artificial Intelligence
 
-⭐ Si este proyecto te resulta útil, puedes darle una **Star** al repositorio.
+⭐ Si este proyecto te resulta útil, puedes darle usuarlo en tucuenta 
 
 Contributions, suggestions and improvements are welcome.
