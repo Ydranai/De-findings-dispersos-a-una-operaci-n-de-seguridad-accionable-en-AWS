@@ -121,7 +121,7 @@ Esto permite pasar de saber que existen credenciales que requieren atención a i
 
 ---
 
-## 📈 Métricas personalizadas
+##  Métricas personalizadas
 
 La solución publica métricas personalizadas en CloudWatch, entre ellas:
 
@@ -178,7 +178,7 @@ Los mecanismos de entrega pueden configurarse según las necesidades de cada org
 
 ---
 
-## ⚙️ Despliegue
+##  Despliegue
 
 ### Requisitos
 
@@ -226,7 +226,7 @@ AWS enviará una solicitud de confirmación al correo configurado.
 
 ---
 
-## 🔐 Principios de seguridad
+## Principios de seguridad
 
 ### Least Privilege
 
